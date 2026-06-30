@@ -4,20 +4,21 @@ Architecture:
 - Single non-streaming LLM call with full codebase + task + diff
 - No conversation history, no tools, no accumulated context
 - Returns structured verdict: approved/rejected with specific feedback
-- Called automatically by the agent loop before git_commit
+- Called by the code_review tool (agent invokes on demand)
 
 Design principle:
 The reviewer has never seen the agent's reasoning, tool calls, or mistakes.
 It evaluates the final code in isolation — exactly like a fresh code reviewer.
 """
 
+import difflib
 import json
 import logging
 from typing import Optional
 
 import httpx
 
-from sandbox import shell_exec, REPO_DIR
+from sandbox import shell_exec, get_sandbox, REPO_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -93,12 +94,138 @@ If the code is correct and ships cleanly:
 """
 
 
+async def _get_file_content(path: str) -> str | None:
+    """Get current file content from the sandbox via native SDK."""
+    try:
+        sb = await get_sandbox()
+        raw = await sb.fs.download_file(path)
+        if raw is None:
+            return None
+        return raw.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+async def _get_committed_content(path: str) -> str | None:
+    """Get the last committed version of a file via git show."""
+    try:
+        r = await shell_exec(f"cd {REPO_DIR} && git show HEAD:{path} 2>/dev/null", timeout=10)
+        if r.get("exit_code", -1) != 0:
+            return None
+        return r.get("stdout", "")
+    except Exception:
+        return None
+
+
+async def _build_diff_native() -> str:
+    """Build a unified diff using the native SDK.
+
+    Uses sb.git.status() to reliably detect changed files (works through
+    the SDK), then computes the diff by comparing current file content
+    (via sb.fs.download_file) against the last committed version
+    (via git show HEAD:path).
+
+    This avoids the unreliable shell_exec("git diff") which silently
+    returns empty output through the Daytona SDK's process.exec.
+    """
+    try:
+        sb = await get_sandbox()
+        status = await sb.git.status(REPO_DIR)
+    except Exception as e:
+        logger.warning("Failed to get git status for diff: %s", e)
+        return "(could not get git status)"
+
+    if not status.file_status:
+        logger.info("No file_status from git.status — clean tree")
+        return "(no changes — working tree clean)"
+
+    diff_sections = []
+    changed_files = []
+
+    for fs in status.file_status:
+        name = fs.name
+        staging = getattr(fs, 'staging', None)
+        worktree = getattr(fs, 'worktree', None)
+        staging_val = staging.value if hasattr(staging, 'value') else str(staging) if staging else None
+        worktree_val = worktree.value if hasattr(worktree, 'value') else str(worktree) if worktree else None
+
+        # Determine file path
+        if name.startswith("./"):
+            rel_path = name[2:]
+        elif name.startswith("/"):
+            # Absolute path — make relative to REPO_DIR
+            if name.startswith(REPO_DIR + "/"):
+                rel_path = name[len(REPO_DIR) + 1:]
+            else:
+                rel_path = name
+        else:
+            rel_path = name
+
+        full_path = f"{REPO_DIR}/{rel_path}"
+        changed_files.append(rel_path)
+
+        # Get current content
+        current = await _get_file_content(full_path)
+
+        # Get committed content
+        committed = await _get_committed_content(rel_path)
+
+        if current is None and committed is None:
+            continue  # Can't diff this file
+
+        # Determine status label
+        if staging_val == 'untracked' or worktree_val == 'untracked':
+            status_label = "new file"
+        elif committed is not None and current is None:
+            status_label = "deleted"
+        else:
+            status_label = "modified"
+
+        # Compute unified diff
+        current_lines = (current or "").splitlines(keepends=True)
+        committed_lines = (committed or "").splitlines(keepends=True)
+
+        diff = difflib.unified_diff(
+            committed_lines,
+            current_lines,
+            fromfile=f"a/{rel_path}",
+            tofile=f"b/{rel_path}",
+            lineterm="",
+        )
+        diff_text = "\n".join(diff)
+
+        if diff_text:
+            diff_sections.append(diff_text)
+        elif status_label == "new file" and current:
+            # New file — show full content as diff
+            diff_sections.append(
+                f"diff --git a/{rel_path} b/{rel_path}\n"
+                f"new file mode 100644\n"
+                f"--- /dev/null\n"
+                f"+++ b/{rel_path}\n"
+                + "\n".join(f"+{line}" for line in current.splitlines())
+            )
+
+    logger.info("Built diff for %d changed files: %s", len(changed_files), changed_files)
+
+    if not diff_sections:
+        return "(no diff — changes may not exist)"
+
+    diff = "\n\n".join(diff_sections)
+
+    # Cap at 50k chars
+    if len(diff) > 50000:
+        diff = diff[:50000] + "\n\n... [diff truncated at 50KB]"
+
+    return diff
+
+
 async def gather_codebase() -> tuple[str, str]:
     """Gather full project context and diff.
 
     Returns (codebase_text, diff_text).
     Codebase_text includes project tree + all file contents.
-    Diff_text is the git diff (unstaged at review time, since git add runs later).
+    Diff_text is built using the native SDK (not shell_exec git diff).
     """
     # 1. Project tree
     tree_result = await shell_exec(
@@ -163,20 +290,8 @@ async def gather_codebase() -> tuple[str, str]:
 
     codebase = f"## Project Tree\n\n{tree}\n\n## Source Files\n" + "\n".join(files_sections)
 
-    # 3. Git diff (unstaged — agent changes are in working directory at this point)
-    diff_result = await shell_exec(f"cd {REPO_DIR} && git diff 2>&1", timeout=15)
-    diff = diff_result.get("stdout", "").strip()
-
-    if not diff:
-        diff_result = await shell_exec(f"cd {REPO_DIR} && git diff --cached 2>&1", timeout=15)
-        diff = diff_result.get("stdout", "").strip()
-
-    if not diff:
-        diff = "(no diff — changes may not exist)"
-
-    # Cap diff at 50k chars
-    if len(diff) > 50000:
-        diff = diff[:50000] + "\n\n... [diff truncated at 50KB]"
+    # 3. Build diff using native SDK (NOT shell_exec git diff)
+    diff = await _build_diff_native()
 
     return codebase, diff
 
@@ -208,6 +323,7 @@ async def run_reviewer(
     logger.info("Reviewer: gathering codebase context...")
     codebase, diff = await gather_codebase()
     logger.info("Reviewer: codebase=%d chars, diff=%d chars", len(codebase), len(diff))
+    logger.info("Reviewer: diff preview: %s", diff[:300])
 
     # Build review prompt
     user_prompt = (
