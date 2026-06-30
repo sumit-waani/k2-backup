@@ -291,10 +291,16 @@ async def run_agent(user_message: str) -> AsyncIterator[str]:
                 # ── Reviewer hook: intercept git_commit ──
                 result = None
                 if fn_name == "git_commit":
-                    # Check if there are changes worth reviewing
-                    # NOTE: We check unstaged diff (not --cached) because git add runs inside _handle_git_commit
+                    # Check if there are changes worth reviewing.
+                    # Check BOTH unstaged and staged — the LLM may have already
+                    # run `git add` before calling git_commit (multi-tool-call step),
+                    # or changes may still be in the working tree.
                     from sandbox import shell_exec as _shell
-                    diff_check = await _shell("cd /home/daytona/repo && git diff --stat 2>&1", timeout=10)
+                    diff_check = await _shell(
+                        "cd /home/daytona/repo && "
+                        "(git diff --stat 2>&1; git diff --cached --stat 2>&1)",
+                        timeout=10,
+                    )
                     has_changes = bool(diff_check.get("stdout", "").strip())
 
                     if has_changes and _review_rounds < MAX_REVIEW_ROUNDS:
