@@ -94,11 +94,11 @@ If the code is correct and ships cleanly:
 
 
 async def gather_codebase() -> tuple[str, str]:
-    """Gather full project context and staged diff.
+    """Gather full project context and diff.
 
     Returns (codebase_text, diff_text).
     Codebase_text includes project tree + all file contents.
-    Diff_text is the staged git diff.
+    Diff_text is the git diff (unstaged at review time, since git add runs later).
     """
     # 1. Project tree
     tree_result = await shell_exec(
@@ -163,16 +163,16 @@ async def gather_codebase() -> tuple[str, str]:
 
     codebase = f"## Project Tree\n\n{tree}\n\n## Source Files\n" + "\n".join(files_sections)
 
-    # 3. Git diff (staged)
-    diff_result = await shell_exec(f"cd {REPO_DIR} && git diff --cached 2>&1", timeout=15)
+    # 3. Git diff (unstaged — agent changes are in working directory at this point)
+    diff_result = await shell_exec(f"cd {REPO_DIR} && git diff 2>&1", timeout=15)
     diff = diff_result.get("stdout", "").strip()
 
     if not diff:
-        diff_result = await shell_exec(f"cd {REPO_DIR} && git diff 2>&1", timeout=15)
+        diff_result = await shell_exec(f"cd {REPO_DIR} && git diff --cached 2>&1", timeout=15)
         diff = diff_result.get("stdout", "").strip()
 
     if not diff:
-        diff = "(no diff — changes may not be staged)"
+        diff = "(no diff — changes may not exist)"
 
     # Cap diff at 50k chars
     if len(diff) > 50000:
