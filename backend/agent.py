@@ -14,6 +14,7 @@ Context management:
 """
 import json
 import logging
+import re
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -21,6 +22,7 @@ import httpx
 
 from db import execute, fetch_all, get_configs, new_id, now_iso
 from reviewer import run_reviewer
+from sandbox import get_sandbox, REPO_DIR
 from tools import TOOL_SCHEMAS, run_tool
 
 logger = logging.getLogger(__name__)
@@ -218,6 +220,25 @@ async def _stream_llm_step(cfg: dict, messages: list[dict]) -> AsyncIterator[dic
     yield {"type": "done", "message": assistant_msg}
 
 
+async def _check_has_changes() -> bool:
+    """Check if the repo has uncommitted changes (staged, unstaged, or untracked).
+
+    Uses the native Daytona SDK git.status() — same reliable path as the
+    git_status tool — instead of shell_exec with compound commands which
+    can silently return empty output through the SDK's process.exec.
+    """
+    try:
+        sb = await get_sandbox()
+        status = await sb.git.status(REPO_DIR)
+        has = bool(status.file_status)
+        logger.info("Review diff check: has_changes=%s (files=%s)", has,
+                     len(status.file_status) if status.file_status else 0)
+        return has
+    except Exception as e:
+        logger.warning("Review diff check failed: %s — assuming changes exist (fail-closed)", e)
+        return True  # Fail-closed: assume changes exist so reviewer runs
+
+
 async def run_agent(user_message: str) -> AsyncIterator[str]:
     """Run the agent loop. user_message is a plain text string."""
     await _save_message("user", user_message)
@@ -288,23 +309,31 @@ async def run_agent(user_message: str) -> AsyncIterator[str]:
                     "arguments": fn_args_str,
                 })
 
-                # ── Reviewer hook: intercept git_commit ──
+                # ── Reviewer hook: intercept git_commit AND shell_exec with git commit ──
+                # The LLM sometimes uses shell_exec to run `git commit` directly,
+                # bypassing the dedicated git_commit tool. We catch both paths.
                 result = None
+                _needs_review = False
                 if fn_name == "git_commit":
+                    _needs_review = True
+                elif fn_name == "shell_exec":
+                    _cmd = fn_args.get("command", "")
+                    if re.search(r'\bgit\s+commit\b', _cmd):
+                        _needs_review = True
+                        logger.info("Review hook: shell_exec contains git commit: %s", _cmd[:200])
+
+                if _needs_review:
                     # Check if there are changes worth reviewing.
-                    # Check BOTH unstaged and staged — the LLM may have already
-                    # run `git add` before calling git_commit (multi-tool-call step),
-                    # or changes may still be in the working tree.
-                    from sandbox import shell_exec as _shell
-                    diff_check = await _shell(
-                        "cd /home/daytona/repo && "
-                        "(git diff --stat 2>&1; git diff --cached --stat 2>&1)",
-                        timeout=10,
-                    )
-                    has_changes = bool(diff_check.get("stdout", "").strip())
+                    # Uses native SDK git.status() — NOT shell_exec with compound
+                    # commands, which can silently return empty output.
+                    has_changes = await _check_has_changes()
 
                     if has_changes and _review_rounds < MAX_REVIEW_ROUNDS:
                         # Run the reviewer
+                        logger.info(
+                            "Reviewer STARTING (round %d/%d) for task: %s",
+                            _review_rounds + 1, MAX_REVIEW_ROUNDS, _user_task[:100],
+                        )
                         yield sse({
                             "type": "review_start",
                             "round": _review_rounds + 1,
@@ -313,6 +342,12 @@ async def run_agent(user_message: str) -> AsyncIterator[str]:
 
                         verdict = await run_reviewer(_user_task, cfg)
                         _review_rounds += 1
+
+                        logger.info(
+                            "Reviewer verdict: approved=%s feedback=%s",
+                            verdict.get("approved"),
+                            (verdict.get("feedback", "")[:200]),
+                        )
 
                         if verdict.get("approved"):
                             # Reviewer approved — proceed with commit
@@ -371,10 +406,15 @@ async def run_agent(user_message: str) -> AsyncIterator[str]:
                             f"{result}"
                         )
                     else:
-                        # No staged changes — let commit proceed normally
+                        # No changes — skip review, proceed with commit
+                        logger.info("Reviewer skipped: no uncommitted changes detected")
+                        yield sse({
+                            "type": "review_skipped",
+                            "reason": "no_changes",
+                        })
                         result = await run_tool(fn_name, fn_args)
                 else:
-                    # Not git_commit — execute tool normally
+                    # Not a commit operation — execute tool normally
                     result = await run_tool(fn_name, fn_args)
 
                 # Notify frontend about tool result

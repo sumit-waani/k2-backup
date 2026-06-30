@@ -232,6 +232,16 @@ function handleStreamEvent(data, assistantId) {
           break;
         }
       }
+    } else if (ev.type === 'review_skipped') {
+      // Diagnostic: reviewer was skipped (e.g. no changes detected)
+      console.log('Reviewer skipped:', ev.reason);
+      content.push({
+        type: 'review',
+        status: 'skipped',
+        feedback: ev.reason === 'no_changes'
+          ? 'Reviewer skipped — no uncommitted changes detected.'
+          : `Reviewer skipped: ${ev.reason}`,
+      });
     } else if (ev.type === 'error') {
       agentError.set(ev.message);
       showToast(ev.message, 'error', 5000);

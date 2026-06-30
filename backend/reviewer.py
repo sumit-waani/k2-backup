@@ -188,8 +188,9 @@ async def run_reviewer(
 ) -> dict:
     """Run the reviewer subagent. Returns parsed verdict dict.
 
-    Fail-closed on HTTP/parse errors (blocks commit). Fail-open only on
-    config errors (no LLM) or network failures (transient).
+    Fail-closed on ALL errors except config errors (no LLM configured).
+    If the reviewer can't reach the LLM, times out, or gets invalid output,
+    the commit is BLOCKED — not silently approved.
     """
     base_url = cfg.get("llm1_url", "")
     api_key = cfg.get("llm1_api_key", "")
@@ -204,7 +205,9 @@ async def run_reviewer(
         }
 
     # Gather full context
+    logger.info("Reviewer: gathering codebase context...")
     codebase, diff = await gather_codebase()
+    logger.info("Reviewer: codebase=%d chars, diff=%d chars", len(codebase), len(diff))
 
     # Build review prompt
     user_prompt = (
@@ -214,6 +217,9 @@ async def run_reviewer(
         "Review the proposed changes against the task and codebase. "
         "Respond with ONLY the JSON verdict."
     )
+
+    prompt_size = len(user_prompt)
+    logger.info("Reviewer: prompt size=%d chars", prompt_size)
 
     # LLM call (non-streaming)
     _b = base_url.rstrip("/")
@@ -233,7 +239,10 @@ async def run_reviewer(
         "Content-Type": "application/json",
     }
 
+    content = ""  # Ensure defined for JSONDecodeError handler
+
     try:
+        logger.info("Reviewer: calling LLM at %s (model=%s, timeout=%ds)...", url, model, timeout)
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=15.0)) as cx:
             resp = await cx.post(url, json=payload, headers=headers)
 
@@ -262,6 +271,8 @@ async def run_reviewer(
                     "feedback": "Reviewer LLM returned an empty response. This usually means the model is overloaded or the prompt was too large.",
                 }
 
+            logger.info("Reviewer: LLM response (%d chars): %s", len(content), content[:300])
+
             # Parse JSON verdict (handle markdown code fences)
             clean = content
             if "```" in clean:
@@ -280,6 +291,7 @@ async def run_reviewer(
             if "issues" not in verdict:
                 verdict["issues"] = []
 
+            logger.info("Reviewer: verdict parsed successfully — approved=%s", verdict.get("approved"))
             return verdict
 
     except json.JSONDecodeError as e:
@@ -293,9 +305,17 @@ async def run_reviewer(
             ),
         }
     except Exception as e:
-        logger.exception("Reviewer failed")
+        # FAIL-CLOSED: any error blocks the commit.
+        # This includes timeouts, connection errors, DNS failures, etc.
+        # The agent can retry the commit, and if the error persists,
+        # it will exhaust review rounds and force-commit with a warning.
+        logger.exception("Reviewer failed — blocking commit (fail-closed)")
         return {
-            "approved": True,
-            "issues": [],
-            "feedback": f"Reviewer skipped due to error: {e}",
+            "approved": False,
+            "issues": [f"Reviewer error: {type(e).__name__}: {str(e)[:200]}"],
+            "feedback": (
+                f"Reviewer failed with {type(e).__name__}: {e}\n"
+                f"The commit was blocked because the reviewer could not complete. "
+                f"Fix the issue or retry the commit."
+            ),
         }

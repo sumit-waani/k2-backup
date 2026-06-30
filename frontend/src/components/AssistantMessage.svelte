@@ -108,16 +108,18 @@
       {:else if segment.type === 'tools'}
         <ToolGroup tools={segment.tools} />
       {:else if segment.type === 'review'}
-        <div class="review-block" class:running={segment.status === 'running'} class:approved={segment.status === 'approved'} class:rejected={segment.status === 'rejected'}>
+        <div class="review-block" class:running={segment.status === 'running'} class:approved={segment.status === 'approved'} class:rejected={segment.status === 'rejected'} class:skipped={segment.status === 'skipped'}>
           <div class="review-header">
-            <span class="review-icon">{segment.status === 'running' ? '🔍' : segment.status === 'approved' ? '✅' : '❌'}</span>
+            <span class="review-icon">{segment.status === 'running' ? '🔍' : segment.status === 'approved' ? '✅' : segment.status === 'rejected' ? '❌' : '⏭️'}</span>
             <span class="review-title">
               {#if segment.status === 'running'}
                 Code Review — Round {segment.round}/{segment.maxRounds}
               {:else if segment.status === 'approved'}
                 {#if segment.forced}Review Forced Through{:else}Review Approved{/if}
-              {:else}
+              {:else if segment.status === 'rejected'}
                 Review Rejected — Round {segment.round}/{segment.maxRounds}
+              {:else if segment.status === 'skipped'}
+                Review Skipped
               {/if}
             </span>
           </div>
@@ -205,6 +207,11 @@
     border-color: var(--color-error);
     background: var(--color-surface-alt);
   }
+  .review-block.skipped {
+    border-color: var(--color-border);
+    background: var(--color-surface-alt);
+    opacity: 0.7;
+  }
   .review-header {
     display: flex;
     align-items: center;
@@ -221,6 +228,9 @@
   }
   .review-block.rejected .review-header {
     background: color-mix(in srgb, var(--color-error) 8%, transparent);
+  }
+  .review-block.skipped .review-header {
+    background: color-mix(in srgb, var(--color-text-muted) 8%, transparent);
   }
   .review-icon { font-size: 14px; }
   .review-title { color: var(--color-text); }
