@@ -1,33 +1,24 @@
-"""Tests for the reviewer hook logic in agent.py.
+"""Tests for the reviewer and code_review tool.
 
 Tests verify:
-1. The reviewer fires for git_commit tool calls
-2. The reviewer fires for shell_exec with `git commit`
-3. The reviewer is skipped when there are no changes
-4. The reviewer is fail-closed on errors (not fail-open)
-5. The review_start/review_result/review_skipped SSE events are emitted
-6. The reviewer blocks commit on rejection
-7. The reviewer force-commits after max rounds
+1. Reviewer fail-closed on errors (timeouts, connection, HTTP, JSON)
+2. Reviewer approves valid code
+3. Reviewer rejects bad code
+4. code_review tool works as a wrapper around run_reviewer
 """
 import asyncio
 import json
 import sys
 import types
-import importlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 # ── Stub out heavy dependencies before importing ──
 
-# Stub daytona_sdk
 daytona_sdk_mod = types.ModuleType("daytona_sdk")
-for attr in [
-    "AsyncDaytona", "DaytonaConfig", "CreateSandboxFromImageParams",
-    "Image", "Resources",
-]:
+for attr in ["AsyncDaytona", "DaytonaConfig", "CreateSandboxFromImageParams", "Image", "Resources"]:
     setattr(daytona_sdk_mod, attr, type(attr, (), {}))
 sys.modules["daytona_sdk"] = daytona_sdk_mod
 
-# Stub paramiko
 paramiko_mod = types.ModuleType("paramiko")
 paramiko_mod.SSHClient = MagicMock
 paramiko_mod.AutoAddPolicy = MagicMock
@@ -36,367 +27,180 @@ paramiko_mod.RSAKey = MagicMock
 paramiko_mod.ECDSAKey = MagicMock
 sys.modules["paramiko"] = paramiko_mod
 
-# Stub aiosqlite with Connection attribute
 aiosqlite_mod = types.ModuleType("aiosqlite")
 aiosqlite_mod.Connection = type("Connection", (), {})
 sys.modules["aiosqlite"] = aiosqlite_mod
 
-# Now import our modules
 sys.path.insert(0, "backend")
 from reviewer import run_reviewer
+from tools import _handle_code_review
 
 
 # ══════════════════════════════════════════════════════════════
-# TEST 1: Reviewer fail-closed on exceptions
+# Reviewer fail-closed tests
 # ══════════════════════════════════════════════════════════════
 
-async def test_reviewer_fail_closed_on_timeout():
-    """The reviewer should return approved=False on timeout, NOT approved=True."""
-    cfg = {
-        "llm1_url": "http://localhost:1/v1",
-        "llm1_api_key": "test-key",
-        "llm1_model": "test-model",
-    }
-
-    with patch("reviewer.gather_codebase", return_value=("codebase", "diff")):
-        with patch("reviewer.httpx.AsyncClient") as mock_client:
-            mock_client.return_value.__aenter__ = AsyncMock(
-                return_value=MagicMock(
-                    post=AsyncMock(side_effect=TimeoutError("Connection timed out"))
-                )
-            )
-            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
-
-            verdict = await run_reviewer("test task", cfg, timeout=1.0)
-
-            assert verdict["approved"] is False, \
-                f"FAIL-OPEN BUG: reviewer returned approved={verdict['approved']} on timeout. Should be False."
-            assert len(verdict.get("issues", [])) > 0, \
-                "Should include error details in issues."
-            print(f"  ✓ Timeout → approved=False, issues={verdict['issues']}")
+async def test_fail_closed_on_timeout():
+    cfg = {"llm1_url": "http://x/v1", "llm1_api_key": "k", "llm1_model": "m"}
+    with patch("reviewer.gather_codebase", return_value=("code", "diff")):
+        with patch("reviewer.httpx.AsyncClient") as mc:
+            mc.return_value.__aenter__ = AsyncMock(return_value=MagicMock(
+                post=AsyncMock(side_effect=TimeoutError("timeout"))))
+            mc.return_value.__aexit__ = AsyncMock(return_value=False)
+            v = await run_reviewer("task", cfg, timeout=1.0)
+            assert v["approved"] is False, f"FAIL-OPEN: approved={v['approved']}"
+            print("  ✓ timeout → approved=False")
 
 
-async def test_reviewer_fail_closed_on_connection_error():
-    """The reviewer should return approved=False on connection errors."""
+async def test_fail_closed_on_connection():
     import httpx
-    cfg = {
-        "llm1_url": "http://localhost:1/v1",
-        "llm1_api_key": "test-key",
-        "llm1_model": "test-model",
-    }
-
-    with patch("reviewer.gather_codebase", return_value=("codebase", "diff")):
-        with patch("reviewer.httpx.AsyncClient") as mock_client:
-            mock_client.return_value.__aenter__ = AsyncMock(
-                return_value=MagicMock(
-                    post=AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
-                )
-            )
-            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
-
-            verdict = await run_reviewer("test task", cfg, timeout=1.0)
-
-            assert verdict["approved"] is False, \
-                f"FAIL-OPEN BUG: reviewer returned approved={verdict['approved']} on connection error."
-            print(f"  ✓ Connection error → approved=False, issues={verdict['issues']}")
+    cfg = {"llm1_url": "http://x/v1", "llm1_api_key": "k", "llm1_model": "m"}
+    with patch("reviewer.gather_codebase", return_value=("code", "diff")):
+        with patch("reviewer.httpx.AsyncClient") as mc:
+            mc.return_value.__aenter__ = AsyncMock(return_value=MagicMock(
+                post=AsyncMock(side_effect=httpx.ConnectError("refused"))))
+            mc.return_value.__aexit__ = AsyncMock(return_value=False)
+            v = await run_reviewer("task", cfg, timeout=1.0)
+            assert v["approved"] is False
+            print("  ✓ connection error → approved=False")
 
 
-# ══════════════════════════════════════════════════════════════
-# TEST 2: Reviewer config skip (only case where approved=True)
-# ══════════════════════════════════════════════════════════════
-
-async def test_reviewer_skip_when_no_llm_config():
-    """The reviewer should return approved=True ONLY when LLM is not configured."""
+async def test_skip_when_no_config():
     cfg = {"llm1_url": "", "llm1_api_key": "", "llm1_model": ""}
-
-    verdict = await run_reviewer("test task", cfg)
-
-    assert verdict["approved"] is True, \
-        "Should auto-approve when LLM is not configured (config error, not runtime error)."
-    print(f"  ✓ No LLM config → approved=True (correct skip)")
+    v = await run_reviewer("task", cfg)
+    assert v["approved"] is True
+    print("  ✓ no config → approved=True (correct skip)")
 
 
-# ══════════════════════════════════════════════════════════════
-# TEST 3: Reviewer rejects on HTTP errors
-# ══════════════════════════════════════════════════════════════
-
-async def test_reviewer_fail_closed_on_http_error():
-    """The reviewer should return approved=False on HTTP errors."""
-    cfg = {
-        "llm1_url": "http://localhost:1/v1",
-        "llm1_api_key": "test-key",
-        "llm1_model": "test-model",
-    }
-
-    mock_response = MagicMock()
-    mock_response.status_code = 500
-    mock_response.text = "Internal Server Error"
-
-    with patch("reviewer.gather_codebase", return_value=("codebase", "diff")):
-        with patch("reviewer.httpx.AsyncClient") as mock_client:
-            mock_post = AsyncMock(return_value=mock_response)
-            mock_client.return_value.__aenter__ = AsyncMock(
-                return_value=MagicMock(post=mock_post)
-            )
-            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
-
-            verdict = await run_reviewer("test task", cfg, timeout=1.0)
-
-            assert verdict["approved"] is False, \
-                f"Should reject on HTTP 500, got approved={verdict['approved']}"
-            print(f"  ✓ HTTP 500 → approved=False")
+async def test_fail_closed_on_http500():
+    cfg = {"llm1_url": "http://x/v1", "llm1_api_key": "k", "llm1_model": "m"}
+    resp = MagicMock(); resp.status_code = 500; resp.text = "err"
+    with patch("reviewer.gather_codebase", return_value=("code", "diff")):
+        with patch("reviewer.httpx.AsyncClient") as mc:
+            mc.return_value.__aenter__ = AsyncMock(return_value=MagicMock(
+                post=AsyncMock(return_value=resp)))
+            mc.return_value.__aexit__ = AsyncMock(return_value=False)
+            v = await run_reviewer("task", cfg, timeout=1.0)
+            assert v["approved"] is False
+            print("  ✓ HTTP 500 → approved=False")
 
 
-# ══════════════════════════════════════════════════════════════
-# TEST 4: Reviewer approves valid code
-# ══════════════════════════════════════════════════════════════
+async def test_approves_valid():
+    cfg = {"llm1_url": "http://x/v1", "llm1_api_key": "k", "llm1_model": "m"}
+    resp = MagicMock(); resp.status_code = 200
+    resp.json.return_value = {"choices": [{"message": {"content": json.dumps(
+        {"approved": True, "issues": [], "feedback": "Good."})}}]}
+    with patch("reviewer.gather_codebase", return_value=("code", "diff")):
+        with patch("reviewer.httpx.AsyncClient") as mc:
+            mc.return_value.__aenter__ = AsyncMock(return_value=MagicMock(
+                post=AsyncMock(return_value=resp)))
+            mc.return_value.__aexit__ = AsyncMock(return_value=False)
+            v = await run_reviewer("task", cfg, timeout=1.0)
+            assert v["approved"] is True
+            print("  ✓ valid code → approved=True")
 
-async def test_reviewer_approves_valid_code():
-    """The reviewer should return approved=True when LLM says code is good."""
-    cfg = {
-        "llm1_url": "http://localhost:1/v1",
-        "llm1_api_key": "test-key",
-        "llm1_model": "test-model",
-    }
 
-    mock_response = MagicMock()
-    mock_response.status_code = 200
-    mock_response.json.return_value = {
-        "choices": [{
-            "message": {
-                "content": json.dumps({
-                    "approved": True,
-                    "issues": [],
-                    "feedback": "Code is correct.",
-                }),
-            },
-        }],
-    }
+async def test_rejects_bad():
+    cfg = {"llm1_url": "http://x/v1", "llm1_api_key": "k", "llm1_model": "m"}
+    resp = MagicMock(); resp.status_code = 200
+    resp.json.return_value = {"choices": [{"message": {"content": json.dumps(
+        {"approved": False, "issues": ["bug"], "feedback": "Fix it."})}}]}
+    with patch("reviewer.gather_codebase", return_value=("code", "diff")):
+        with patch("reviewer.httpx.AsyncClient") as mc:
+            mc.return_value.__aenter__ = AsyncMock(return_value=MagicMock(
+                post=AsyncMock(return_value=resp)))
+            mc.return_value.__aexit__ = AsyncMock(return_value=False)
+            v = await run_reviewer("task", cfg, timeout=1.0)
+            assert v["approved"] is False
+            assert len(v["issues"]) > 0
+            print("  ✓ bad code → approved=False")
 
-    with patch("reviewer.gather_codebase", return_value=("codebase", "diff")):
-        with patch("reviewer.httpx.AsyncClient") as mock_client:
-            mock_post = AsyncMock(return_value=mock_response)
-            mock_client.return_value.__aenter__ = AsyncMock(
-                return_value=MagicMock(post=mock_post)
-            )
-            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
 
-            verdict = await run_reviewer("test task", cfg, timeout=1.0)
-
-            assert verdict["approved"] is True
-            assert verdict["feedback"] == "Code is correct."
-            print(f"  ✓ Valid code → approved=True")
+async def test_fail_closed_on_invalid_json():
+    cfg = {"llm1_url": "http://x/v1", "llm1_api_key": "k", "llm1_model": "m"}
+    resp = MagicMock(); resp.status_code = 200
+    resp.json.return_value = {"choices": [{"message": {"content": "huh?"}}]}
+    with patch("reviewer.gather_codebase", return_value=("code", "diff")):
+        with patch("reviewer.httpx.AsyncClient") as mc:
+            mc.return_value.__aenter__ = AsyncMock(return_value=MagicMock(
+                post=AsyncMock(return_value=resp)))
+            mc.return_value.__aexit__ = AsyncMock(return_value=False)
+            v = await run_reviewer("task", cfg, timeout=1.0)
+            assert v["approved"] is False
+            print("  ✓ invalid JSON → approved=False")
 
 
 # ══════════════════════════════════════════════════════════════
-# TEST 5: Reviewer rejects bad code
+# code_review tool tests
 # ══════════════════════════════════════════════════════════════
 
-async def test_reviewer_rejects_bad_code():
-    """The reviewer should return approved=False when LLM finds issues."""
-    cfg = {
-        "llm1_url": "http://localhost:1/v1",
-        "llm1_api_key": "test-key",
-        "llm1_model": "test-model",
-    }
-
-    mock_response = MagicMock()
-    mock_response.status_code = 200
-    mock_response.json.return_value = {
-        "choices": [{
-            "message": {
-                "content": json.dumps({
-                    "approved": False,
-                    "issues": ["Missing null check on line 42"],
-                    "feedback": "The code will crash on empty input.",
-                }),
-            },
-        }],
-    }
-
-    with patch("reviewer.gather_codebase", return_value=("codebase", "diff")):
-        with patch("reviewer.httpx.AsyncClient") as mock_client:
-            mock_post = AsyncMock(return_value=mock_response)
-            mock_client.return_value.__aenter__ = AsyncMock(
-                return_value=MagicMock(post=mock_post)
-            )
-            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
-
-            verdict = await run_reviewer("test task", cfg, timeout=1.0)
-
-            assert verdict["approved"] is False
-            assert len(verdict["issues"]) > 0
-            print(f"  ✓ Bad code → approved=False, issues={verdict['issues']}")
+async def test_code_review_tool_approved():
+    """code_review tool should return formatted output on approval."""
+    cfg = {"llm1_url": "http://x/v1", "llm1_api_key": "k", "llm1_model": "m"}
+    with patch("tools.get_configs", return_value=cfg):
+        with patch("tools.run_reviewer", return_value={
+            "approved": True, "issues": [], "feedback": "Looks good."
+        }):
+            result = await _handle_code_review({})
+            assert "PASSED" in result
+            assert "Looks good" in result
+            print(f"  ✓ approved → {result[:80]}")
 
 
-# ══════════════════════════════════════════════════════════════
-# TEST 6: agent.py _check_has_changes
-# ══════════════════════════════════════════════════════════════
-
-async def test_check_has_changes_uses_native_sdk():
-    """_check_has_changes should use sb.git.status(), not shell_exec."""
-    import agent as agent_mod
-
-    mock_status = MagicMock()
-    mock_status.file_status = [MagicMock()]  # One file changed
-
-    mock_sb = MagicMock()
-    mock_sb.git.status = AsyncMock(return_value=mock_status)
-
-    with patch.object(agent_mod, "get_sandbox", return_value=mock_sb):
-        result = await agent_mod._check_has_changes()
-
-    assert result is True
-    mock_sb.git.status.assert_called_once()
-    print(f"  ✓ _check_has_changes uses native SDK git.status()")
+async def test_code_review_tool_rejected():
+    """code_review tool should return formatted output on rejection."""
+    cfg = {"llm1_url": "http://x/v1", "llm1_api_key": "k", "llm1_model": "m"}
+    with patch("tools.get_configs", return_value=cfg):
+        with patch("tools.run_reviewer", return_value={
+            "approved": False, "issues": ["null check", "edge case"], "feedback": "Fix bugs."
+        }):
+            result = await _handle_code_review({"task_description": "add auth"})
+            assert "FAILED" in result
+            assert "null check" in result
+            assert "Fix bugs" in result
+            print(f"  ✓ rejected → {result[:80]}")
 
 
-async def test_check_has_changes_returns_false_on_clean():
-    """_check_has_changes should return False when no changes."""
-    import agent as agent_mod
-
-    mock_status = MagicMock()
-    mock_status.file_status = None  # Clean working tree
-
-    mock_sb = MagicMock()
-    mock_sb.git.status = AsyncMock(return_value=mock_status)
-
-    with patch.object(agent_mod, "get_sandbox", return_value=mock_sb):
-        result = await agent_mod._check_has_changes()
-
-    assert result is False
-    print(f"  ✓ _check_has_changes returns False on clean tree")
-
-
-async def test_check_has_changes_fail_closed():
-    """_check_has_changes should return True (fail-closed) when SDK errors."""
-    import agent as agent_mod
-
-    mock_sb = MagicMock()
-    mock_sb.git.status = AsyncMock(side_effect=Exception("SDK error"))
-
-    with patch.object(agent_mod, "get_sandbox", return_value=mock_sb):
-        result = await agent_mod._check_has_changes()
-
-    assert result is True, "Should fail-closed (assume changes exist)"
-    print(f"  ✓ _check_has_changes fails closed on SDK error")
+async def test_code_review_tool_no_config():
+    """code_review tool should error when LLM not configured."""
+    cfg = {"llm1_url": "", "llm1_api_key": "", "llm1_model": ""}
+    with patch("tools.get_configs", return_value=cfg):
+        result = await _handle_code_review({})
+        assert "error" in result.lower() or "not configured" in result.lower()
+        print(f"  ✓ no config → error")
 
 
 # ══════════════════════════════════════════════════════════════
-# TEST 7: shell_exec git commit detection
-# ══════════════════════════════════════════════════════════════
-
-def test_git_commit_regex():
-    """The regex should detect git commit in various shell command forms."""
-    import re
-    pattern = r'\bgit\s+commit\b'
-
-    test_cases = [
-        ('git commit -m "fix: bug"', True),
-        ('git add -A && git commit -m "fix"', True),
-        ('cd /repo && git add . && git commit -m "test"', True),
-        ('git commit --amend -m "updated"', True),
-        ('git commit --allow-empty -m "trigger"', True),
-        ('GIT_AUTHOR_NAME="K" git commit -m "x"', True),
-        ('git status', False),
-        ('git log --oneline', False),
-        ('git diff --stat', False),
-        ('git push origin main', False),
-        ('echo "use git commit to save"', True),  # edge case — acceptable false positive
-        ('git push', False),
-    ]
-
-    for cmd, expected in test_cases:
-        result = bool(re.search(pattern, cmd))
-        status = "✓" if result == expected else "✗ FAIL"
-        if result != expected:
-            print(f"  {status} '{cmd}' → {result} (expected {expected})")
-            assert False, f"Regex mismatch for: {cmd}"
-        else:
-            print(f"  {status} '{cmd}' → {result}")
-
-
-# ══════════════════════════════════════════════════════════════
-# TEST 8: reviewer returns invalid JSON → fail-closed
-# ══════════════════════════════════════════════════════════════
-
-async def test_reviewer_fail_closed_on_invalid_json():
-    """The reviewer should return approved=False when LLM returns garbage."""
-    cfg = {
-        "llm1_url": "http://localhost:1/v1",
-        "llm1_api_key": "test-key",
-        "llm1_model": "test-model",
-    }
-
-    mock_response = MagicMock()
-    mock_response.status_code = 200
-    mock_response.json.return_value = {
-        "choices": [{
-            "message": {
-                "content": "I'm not sure about this code, let me think...",
-            },
-        }],
-    }
-
-    with patch("reviewer.gather_codebase", return_value=("codebase", "diff")):
-        with patch("reviewer.httpx.AsyncClient") as mock_client:
-            mock_post = AsyncMock(return_value=mock_response)
-            mock_client.return_value.__aenter__ = AsyncMock(
-                return_value=MagicMock(post=mock_post)
-            )
-            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
-
-            verdict = await run_reviewer("test task", cfg, timeout=1.0)
-
-            assert verdict["approved"] is False, \
-                f"Should reject on invalid JSON, got approved={verdict['approved']}"
-            print(f"  ✓ Invalid JSON → approved=False")
-
-
-# ══════════════════════════════════════════════════════════════
-# Run all tests
+# Run
 # ══════════════════════════════════════════════════════════════
 
 async def main():
     tests = [
-        ("Reviewer fail-closed on timeout", test_reviewer_fail_closed_on_timeout),
-        ("Reviewer fail-closed on connection error", test_reviewer_fail_closed_on_connection_error),
-        ("Reviewer skip when no LLM config", test_reviewer_skip_when_no_llm_config),
-        ("Reviewer fail-closed on HTTP error", test_reviewer_fail_closed_on_http_error),
-        ("Reviewer approves valid code", test_reviewer_approves_valid_code),
-        ("Reviewer rejects bad code", test_reviewer_rejects_bad_code),
-        ("_check_has_changes uses native SDK", test_check_has_changes_uses_native_sdk),
-        ("_check_has_changes returns False on clean", test_check_has_changes_returns_false_on_clean),
-        ("_check_has_changes fail-closed", test_check_has_changes_fail_closed),
-        ("Git commit regex detection", test_git_commit_regex),
-        ("Reviewer fail-closed on invalid JSON", test_reviewer_fail_closed_on_invalid_json),
+        ("Fail-closed on timeout", test_fail_closed_on_timeout),
+        ("Fail-closed on connection", test_fail_closed_on_connection),
+        ("Skip when no config", test_skip_when_no_config),
+        ("Fail-closed on HTTP 500", test_fail_closed_on_http500),
+        ("Approves valid code", test_approves_valid),
+        ("Rejects bad code", test_rejects_bad),
+        ("Fail-closed on invalid JSON", test_fail_closed_on_invalid_json),
+        ("code_review tool: approved", test_code_review_tool_approved),
+        ("code_review tool: rejected", test_code_review_tool_rejected),
+        ("code_review tool: no config", test_code_review_tool_no_config),
     ]
 
-    passed = 0
-    failed = 0
-
-    for name, test_fn in tests:
-        print(f"\n{'─'*60}")
-        print(f"TEST: {name}")
-        print(f"{'─'*60}")
+    passed = failed = 0
+    for name, fn in tests:
+        print(f"\n{'─'*50}\nTEST: {name}\n{'─'*50}")
         try:
-            if callable(test_fn) and not asyncio.iscoroutinefunction(test_fn):
-                test_fn()
-            else:
-                await test_fn()
+            await fn()
             passed += 1
-            print(f"  ✅ PASSED")
+            print("  ✅ PASSED")
         except Exception as e:
             failed += 1
             print(f"  ❌ FAILED: {e}")
 
-    print(f"\n{'═'*60}")
-    print(f"RESULTS: {passed} passed, {failed} failed, {passed + failed} total")
-    print(f"{'═'*60}")
-
+    print(f"\n{'═'*50}\nRESULTS: {passed}/{passed+failed} passed\n{'═'*50}")
     return failed == 0
 
-
 if __name__ == "__main__":
-    success = asyncio.run(main())
-    sys.exit(0 if success else 1)
+    sys.exit(0 if asyncio.run(main()) else 1)

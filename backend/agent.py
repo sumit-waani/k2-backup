@@ -6,7 +6,6 @@ Architecture:
 - Tool results are fed back to the LLM as tool messages
 - The final text response ends the loop
 - All events are streamed to the frontend via SSE
-- Before git_commit: mandatory reviewer subagent runs (fresh context, full codebase)
 
 Context management:
 - Full history is loaded from DB (messages table) every turn
@@ -14,21 +13,17 @@ Context management:
 """
 import json
 import logging
-import re
 from pathlib import Path
 from typing import AsyncIterator
 
 import httpx
 
 from db import execute, fetch_all, get_configs, new_id, now_iso
-from reviewer import run_reviewer
-from sandbox import get_sandbox, REPO_DIR
 from tools import TOOL_SCHEMAS, run_tool
 
 logger = logging.getLogger(__name__)
 
 MAX_STEPS = 250
-MAX_REVIEW_ROUNDS = 2
 
 # Load default system prompt from SYSTEM_PROMPT.md if it exists
 _PROMPT_FILE = Path(__file__).parent.parent / "SYSTEM_PROMPT.md"
@@ -40,6 +35,7 @@ _FALLBACK_PROMPT = (
     "Write tests first, confirm they fail, implement, confirm they pass.\n"
     "Check off subtasks in scratchpad as you complete them.\n"
     "If stuck 3 times on same approach, stop and reassess.\n"
+    "Before git_commit: use code_review to check your changes. Fix any issues it finds.\n"
     "Use git_commit + git_push to ship. Be concise. Report outcomes, not process."
 )
 
@@ -220,25 +216,6 @@ async def _stream_llm_step(cfg: dict, messages: list[dict]) -> AsyncIterator[dic
     yield {"type": "done", "message": assistant_msg}
 
 
-async def _check_has_changes() -> bool:
-    """Check if the repo has uncommitted changes (staged, unstaged, or untracked).
-
-    Uses the native Daytona SDK git.status() — same reliable path as the
-    git_status tool — instead of shell_exec with compound commands which
-    can silently return empty output through the SDK's process.exec.
-    """
-    try:
-        sb = await get_sandbox()
-        status = await sb.git.status(REPO_DIR)
-        has = bool(status.file_status)
-        logger.info("Review diff check: has_changes=%s (files=%s)", has,
-                     len(status.file_status) if status.file_status else 0)
-        return has
-    except Exception as e:
-        logger.warning("Review diff check failed: %s — assuming changes exist (fail-closed)", e)
-        return True  # Fail-closed: assume changes exist so reviewer runs
-
-
 async def run_agent(user_message: str) -> AsyncIterator[str]:
     """Run the agent loop. user_message is a plain text string."""
     await _save_message("user", user_message)
@@ -249,10 +226,6 @@ async def run_agent(user_message: str) -> AsyncIterator[str]:
 
     history = await _load_history()
     messages = [{"role": "system", "content": system_prompt}] + history
-
-    # Track reviewer state for this run
-    _user_task = user_message  # Original task for reviewer context
-    _review_rounds = 0         # How many times reviewer has rejected
 
     for step in range(MAX_STEPS):
         cfg = await get_configs()
@@ -280,7 +253,6 @@ async def run_agent(user_message: str) -> AsyncIterator[str]:
 
         # If the LLM wants to call tools
         tool_calls = assistant_msg.get("tool_calls") or []
-        finish = assistant_msg.get("_finish_reason")
 
         if tool_calls:
             # Add the assistant message (with tool_calls) to context
@@ -309,113 +281,8 @@ async def run_agent(user_message: str) -> AsyncIterator[str]:
                     "arguments": fn_args_str,
                 })
 
-                # ── Reviewer hook: intercept git_commit AND shell_exec with git commit ──
-                # The LLM sometimes uses shell_exec to run `git commit` directly,
-                # bypassing the dedicated git_commit tool. We catch both paths.
-                result = None
-                _needs_review = False
-                if fn_name == "git_commit":
-                    _needs_review = True
-                elif fn_name == "shell_exec":
-                    _cmd = fn_args.get("command", "")
-                    if re.search(r'\bgit\s+commit\b', _cmd):
-                        _needs_review = True
-                        logger.info("Review hook: shell_exec contains git commit: %s", _cmd[:200])
-
-                if _needs_review:
-                    # Check if there are changes worth reviewing.
-                    # Uses native SDK git.status() — NOT shell_exec with compound
-                    # commands, which can silently return empty output.
-                    has_changes = await _check_has_changes()
-
-                    if has_changes and _review_rounds < MAX_REVIEW_ROUNDS:
-                        # Run the reviewer
-                        logger.info(
-                            "Reviewer STARTING (round %d/%d) for task: %s",
-                            _review_rounds + 1, MAX_REVIEW_ROUNDS, _user_task[:100],
-                        )
-                        yield sse({
-                            "type": "review_start",
-                            "round": _review_rounds + 1,
-                            "max_rounds": MAX_REVIEW_ROUNDS,
-                        })
-
-                        verdict = await run_reviewer(_user_task, cfg)
-                        _review_rounds += 1
-
-                        logger.info(
-                            "Reviewer verdict: approved=%s feedback=%s",
-                            verdict.get("approved"),
-                            (verdict.get("feedback", "")[:200]),
-                        )
-
-                        if verdict.get("approved"):
-                            # Reviewer approved — proceed with commit
-                            yield sse({
-                                "type": "review_result",
-                                "approved": True,
-                                "feedback": verdict.get("feedback", ""),
-                            })
-                            result = await run_tool(fn_name, fn_args)
-                        else:
-                            # Reviewer rejected — block commit, return feedback
-                            issues = verdict.get("issues", [])
-                            feedback = verdict.get("feedback", "Reviewer rejected the changes.")
-                            issues_text = "\n".join(f"  - {i}" for i in issues) if issues else ""
-                            review_feedback = (
-                                f"[REVIEWER REJECTED — Round {_review_rounds}/{MAX_REVIEW_ROUNDS}]\n"
-                                f"The code reviewer found issues with your changes and blocked the commit.\n"
-                            )
-                            if issues_text:
-                                review_feedback += f"\nIssues:\n{issues_text}\n"
-                            review_feedback += f"\nFeedback:\n{feedback}\n"
-                            review_feedback += (
-                                f"\nFix the issues above and try committing again. "
-                                f"You have {MAX_REVIEW_ROUNDS - _review_rounds} review round(s) remaining."
-                            )
-
-                            yield sse({
-                                "type": "review_result",
-                                "approved": False,
-                                "feedback": feedback,
-                                "issues": issues,
-                            })
-
-                            logger.info(
-                                "Reviewer REJECTED commit (round %d/%d): %s",
-                                _review_rounds, MAX_REVIEW_ROUNDS,
-                                feedback[:200],
-                            )
-
-                            # Return rejection as tool result — agent sees it and reworks
-                            result = review_feedback
-                    elif has_changes and _review_rounds >= MAX_REVIEW_ROUNDS:
-                        # Max review rounds exhausted — force commit with warning
-                        yield sse({
-                            "type": "review_result",
-                            "approved": True,
-                            "feedback": f"Forced after {MAX_REVIEW_ROUNDS} review rounds.",
-                            "forced": True,
-                        })
-                        logger.warning("Forcing commit after %d review rounds", _review_rounds)
-                        result = await run_tool(fn_name, fn_args)
-                        result = (
-                            f"[COMMITTED — forced after {MAX_REVIEW_ROUNDS} reviewer rejections]\n"
-                            f"The reviewer rejected this {MAX_REVIEW_ROUNDS} times. "
-                            f"Committing anyway, but review the feedback above carefully.\n\n"
-                            f"{result}"
-                        )
-                    else:
-                        # No changes — skip review, proceed with commit
-                        logger.info("Reviewer skipped: no uncommitted changes detected")
-                        yield sse({
-                            "type": "review_skipped",
-                            "reason": "no_changes",
-                        })
-                        result = await run_tool(fn_name, fn_args)
-                else:
-                    # Not a commit operation — execute tool normally
-                    result = await run_tool(fn_name, fn_args)
+                # Execute tool — no interception, no hooks
+                result = await run_tool(fn_name, fn_args)
 
                 # Notify frontend about tool result
                 yield sse({

@@ -51,28 +51,23 @@ Before touching any code, complete ALL phases in order. Skipping a phase is a fa
   Would you approve this PR? If not, fix it before reporting.
 
 ### Phase 5: Ship
+- `code_review` — run a code review on your changes before committing.
 - `git_commit` with a clear message: what changed + why.
 - `git_push`
 - Update scratchpad with the outcome.
 
 ---
 
-## CODE REVIEWER — Automatic gate before every commit
+## CODE REVIEW TOOL
 
-When you call `git_commit`, the system automatically runs a code reviewer before
-the commit is created. The reviewer:
-- Gets the full project codebase (every file), your task description, and the git diff
-- Has ZERO access to your conversation history or reasoning — fresh eyes only
-- Checks for: bugs, missing edge cases, logic errors, regressions, code quality
-- Returns: APPROVED (commit proceeds) or REJECTED (commit blocked, feedback returned)
+Use `code_review` before committing to get a second opinion on your changes.
+The reviewer gets your full codebase, the git diff, and your task description.
+It checks for bugs, regressions, logic errors, and code quality issues.
 
-If the reviewer rejects your changes:
-- You'll see specific feedback about what's wrong
-- Fix the issues and try committing again
-- You get up to 2 review rounds before the commit is forced through
-
-Take reviewer feedback seriously. If it says something is wrong, it probably is.
-Don't just re-commit the same code hoping for a different verdict.
+- Call it with no arguments — it uses the git diff and codebase automatically.
+- Or pass `task_description` for more targeted feedback.
+- If it returns issues, fix them before committing.
+- It's a tool, not a gate — you decide when to use it.
 
 ---
 

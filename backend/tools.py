@@ -20,6 +20,7 @@ import httpx
 import paramiko
 
 from db import get_configs, update_configs
+from reviewer import run_reviewer
 from sandbox import shell_exec, get_sandbox, REPO_DIR
 
 logger = logging.getLogger(__name__)
@@ -425,6 +426,32 @@ TOOL_SCHEMAS: list[dict] = [
                     },
                 },
                 "required": ["title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "code_review",
+            "description": (
+                "Review your uncommitted changes before committing. "
+                "Gathers the full codebase and git diff, then sends them to a "
+                "reviewer LLM for a thorough code review. Returns approved/rejected "
+                "with specific feedback and issues. "
+                "Use this BEFORE git_commit to catch bugs, regressions, and quality issues."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_description": {
+                        "type": "string",
+                        "description": (
+                            "Description of what you're trying to accomplish. "
+                            "Used as context for the reviewer. "
+                            "If omitted, the reviewer uses the git diff and codebase only."
+                        ),
+                    },
+                },
             },
         },
     },
@@ -921,6 +948,42 @@ async def _handle_git_pr_create(args: dict) -> str:
     except Exception as e:
         return _error("git_pr_create", str(e))
 
+
+async def _handle_code_review(args: dict) -> str:
+    """Run the code reviewer on uncommitted changes."""
+    task = args.get("task_description", "")
+    cfg = await get_configs()
+
+    base_url = cfg.get("llm1_url", "")
+    api_key = cfg.get("llm1_api_key", "")
+    model = cfg.get("llm1_model", "")
+
+    if not base_url or not api_key or not model:
+        return _error("code_review", "LLM not configured. Open Settings to set URL, key and model.")
+
+    logger.info("code_review: starting review (task=%s)", task[:100] if task else "(none)")
+    verdict = await run_reviewer(task, cfg)
+    logger.info("code_review: verdict approved=%s", verdict.get("approved"))
+
+    approved = verdict.get("approved", False)
+    issues = verdict.get("issues", [])
+    feedback = verdict.get("feedback", "")
+
+    parts = []
+    if approved:
+        parts.append("✅ Code review PASSED — changes look good.")
+    else:
+        parts.append("❌ Code review FAILED — issues found:")
+
+    if issues:
+        for issue in issues:
+            parts.append(f"  - {issue}")
+
+    if feedback:
+        parts.append(f"\nFeedback: {feedback}")
+
+    return "\n".join(parts)
+
 # ---------- Tool router ----------
 
 TOOL_HANDLERS = {
@@ -945,6 +1008,7 @@ TOOL_HANDLERS = {
     "git_log": _handle_git_log,
     "git_branch": _handle_git_branch,
     "git_pr_create": _handle_git_pr_create,
+    "code_review": _handle_code_review,
 }
 
 async def run_tool(name: str, arguments: dict) -> str:
