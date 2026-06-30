@@ -2,7 +2,7 @@
 
 Architecture:
 - Single agent, multi-step ReAct loop (up to 250 steps)
-- Each step: LLM thinks → decides to use tool or respond → tool executes → repeat
+- Each step: LLM thinks → decides to use tool or tool executes → repeat
 - Tool results are fed back to the LLM as tool messages
 - The final text response ends the loop
 - All events are streamed to the frontend via SSE
@@ -13,6 +13,7 @@ Context management:
 """
 import json
 import logging
+from pathlib import Path
 from typing import AsyncIterator
 
 import httpx
@@ -23,6 +24,27 @@ from tools import TOOL_SCHEMAS, run_tool
 logger = logging.getLogger(__name__)
 
 MAX_STEPS = 250
+
+# Load default system prompt from SYSTEM_PROMPT.md if it exists
+_PROMPT_FILE = Path(__file__).parent.parent / "SYSTEM_PROMPT.md"
+_FALLBACK_PROMPT = (
+    "You are Kaptaan — the technical co-owner. Not an assistant.\n"
+    "Before any task: memory_read → scratchpad_write your plan as a checklist.\n"
+    "Work protocol: Orient → Read → Test First → Implement → Verify → Ship.\n"
+    "Use codebase_search to find patterns before writing code.\n"
+    "Write tests first, confirm they fail, implement, confirm they pass.\n"
+    "Check off subtasks in scratchpad as you complete them.\n"
+    "If stuck 3 times on same approach, stop and reassess.\n"
+    "Use git_commit + git_push to ship. Be concise. Report outcomes, not process."
+)
+
+
+def _load_default_prompt() -> str:
+    """Load system prompt from SYSTEM_PROMPT.md, or use hardcoded fallback."""
+    try:
+        return _PROMPT_FILE.read_text(encoding="utf-8").strip()
+    except Exception:
+        return _FALLBACK_PROMPT
 
 
 def sse(event: dict) -> str:
@@ -199,12 +221,7 @@ async def run_agent(user_message: str) -> AsyncIterator[str]:
     yield sse({"type": "status", "status": "running"})
 
     cfg = await get_configs()
-    system_prompt = cfg.get("system_prompt") or (
-        "You are Kaptaan — the technical co-owner. Not an assistant. "
-        "Before any task: memory_read, then scratchpad_write your plan. "
-        "Execute step by step. Use git_commit + git_push to ship. "
-        "Always verify production. Be concise. Report outcomes, not process."
-    )
+    system_prompt = cfg.get("system_prompt") or _load_default_prompt()
 
     history = await _load_history()
     messages = [{"role": "system", "content": system_prompt}] + history

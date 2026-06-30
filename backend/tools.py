@@ -64,6 +64,40 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "codebase_search",
+            "description": (
+                "Search the codebase using ripgrep (rg). Returns matching lines with file paths "
+                "and line numbers. Use this BEFORE reading files to find where things are defined, "
+                "used, or referenced. Searches the entire project tree by default. "
+                "Use this to orient yourself before making changes — don't guess file paths."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query (supports regex patterns)",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory or file path to search in. Default: entire repo",
+                    },
+                    "glob": {
+                        "type": "string",
+                        "description": "File glob filter (e.g. '*.py', '*.js'). Optional.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Max number of matching lines to return. Default: 40",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "file_read",
             "description": (
                 "Read a file from the Daytona sandbox. Returns the file contents. "
@@ -411,6 +445,63 @@ async def _handle_shell_exec(args: dict) -> str:
     if r.get("exit_code", -1) != 0:
         parts.append(f"[exit_code: {r['exit_code']}]")
     return "\n".join(parts) if parts else "(no output)"
+
+
+async def _handle_codebase_search(args: dict) -> str:
+    """Search the codebase using ripgrep."""
+    query = args.get("query", "")
+    if not query:
+        return _error("codebase_search", "No query provided.")
+    path = args.get("path", "") or REPO_DIR
+    glob_filter = args.get("glob", "")
+    max_results = args.get("max_results", 40)
+
+    # Build ripgrep command
+    # --line-number: show line numbers
+    # --no-heading: one result per line (easier to parse)
+    # --color=never: no ANSI codes
+    # --max-count: limit matches per file
+    # -i: case insensitive by default for broader results
+    cmd_parts = [
+        "rg", "--line-number", "--no-heading", "--color=never",
+        "--max-count", str(max_results),
+    ]
+    if glob_filter:
+        cmd_parts.extend(["--glob", glob_filter])
+    # Escape the query for shell safety
+    cmd_parts.extend(["--", json.dumps(query)[1:-1], path])
+
+    # Limit total output lines
+    cmd = " ".join(cmd_parts) + f" 2>&1 | head -{max_results * 2}"
+    r = await shell_exec(cmd, timeout=30)
+
+    if r.get("exit_code", -1) == 1:
+        # ripgrep exit code 1 = no matches (not an error)
+        return f"No matches found for: {query}"
+    if r.get("exit_code", -1) != 0:
+        stderr = r.get("stderr", "").strip()
+        if stderr:
+            return _error("codebase_search", stderr)
+        return f"No matches found for: {query}"
+
+    output = r.get("stdout", "").strip()
+    if not output:
+        return f"No matches found for: {query}"
+
+    # Format output: strip repo prefix from paths for readability
+    lines = output.split("\n")
+    formatted = []
+    for line in lines:
+        if line.startswith(REPO_DIR + "/"):
+            line = line[len(REPO_DIR) + 1:]
+        formatted.append(line)
+
+    result = "\n".join(formatted)
+    # Cap total output to prevent context flooding
+    if len(result) > 8000:
+        result = result[:8000] + "\n... [truncated — use path/glob to narrow results]"
+    return f"Found matches:\n{result}"
+
 
 async def _handle_file_read(args: dict) -> str:
     path = args.get("path", "")
@@ -834,6 +925,7 @@ async def _handle_git_pr_create(args: dict) -> str:
 
 TOOL_HANDLERS = {
     "shell_exec": _handle_shell_exec,
+    "codebase_search": _handle_codebase_search,
     "file_read": _handle_file_read,
     "file_write": _handle_file_write,
     "vps_exec": _handle_vps_exec,

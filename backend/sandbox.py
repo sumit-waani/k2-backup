@@ -69,7 +69,7 @@ def _build_image() -> Image:
         Image.debian_slim("3.12")
         .run_commands(
             "apt-get update",
-            "apt-get install -y git curl ca-certificates openssh-client",
+            "apt-get install -y git curl ca-certificates openssh-client ripgrep",
         )
     )
 
