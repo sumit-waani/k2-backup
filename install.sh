@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-REPO_URL="${REPO_URL:-https://github.com/sumit-waani/k2.git}"
+REPO_URL="${REPO_URL:-https://github.com/sumit-waani/k2-backup.git}"
 APP_DIR="${APP_DIR:-/opt/kaptaan}"
 DB_DIR="${DB_DIR:-/var/lib/kaptaan}"
 BRANCH="${BRANCH:-main}"
