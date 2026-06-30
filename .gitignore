@@ -1,0 +1,53 @@
+# Dependencies
+node_modules/
+
+# Production builds
+dist/
+/build
+
+# Environment files
+.env
+.env.*
+*.env
+
+# Credentials & secrets
+credentials.json
+*token.json*
+*.key
+*.pem
+.credentials
+
+# Database files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+dump.rdb
+
+# System files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+*.swp
+*.swo
+*~
+
+# Scratchpad (working file, never committed)
+scratchpad.md
