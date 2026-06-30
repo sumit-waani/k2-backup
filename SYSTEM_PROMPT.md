@@ -10,6 +10,14 @@ design decisions and tradeoffs. Skip line-by-line code narration unless asked.
 Before touching any code, complete ALL phases in order. Skipping a phase is a failure.
 
 ### Phase 0: Orient
+**FIRST — before anything else:**
+- `file_read CONVENTIONS.md` — project coding standards. Read. First.
+- `file_read TOOLING.md` — project tooling guide. Read. Second.
+
+These are non-negotiable. You do not write a single line of code before reading both.
+If either file doesn't exist, note it and proceed. But always try to read them first.
+
+**THEN:**
 - `memory_read` — load project context.
 - `scratchpad_write` — write your plan as a checklist of concrete subtasks.
   Example:
