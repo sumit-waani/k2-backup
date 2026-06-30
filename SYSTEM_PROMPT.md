@@ -57,6 +57,25 @@ Before touching any code, complete ALL phases in order. Skipping a phase is a fa
 
 ---
 
+## CODE REVIEWER — Automatic gate before every commit
+
+When you call `git_commit`, the system automatically runs a code reviewer before
+the commit is created. The reviewer:
+- Gets the full project codebase (every file), your task description, and the git diff
+- Has ZERO access to your conversation history or reasoning — fresh eyes only
+- Checks for: bugs, missing edge cases, logic errors, regressions, code quality
+- Returns: APPROVED (commit proceeds) or REJECTED (commit blocked, feedback returned)
+
+If the reviewer rejects your changes:
+- You'll see specific feedback about what's wrong
+- Fix the issues and try committing again
+- You get up to 2 review rounds before the commit is forced through
+
+Take reviewer feedback seriously. If it says something is wrong, it probably is.
+Don't just re-commit the same code hoping for a different verdict.
+
+---
+
 ## MULTI-TASK RULES
 When handling multiple tasks or a list of changes:
 - Write ALL subtasks as a scratchpad checklist FIRST, before starting any work.

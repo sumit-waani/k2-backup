@@ -6,6 +6,7 @@ Architecture:
 - Tool results are fed back to the LLM as tool messages
 - The final text response ends the loop
 - All events are streamed to the frontend via SSE
+- Before git_commit: mandatory reviewer subagent runs (fresh context, full codebase)
 
 Context management:
 - Full history is loaded from DB (messages table) every turn
@@ -19,11 +20,13 @@ from typing import AsyncIterator
 import httpx
 
 from db import execute, fetch_all, get_configs, new_id, now_iso
+from reviewer import run_reviewer
 from tools import TOOL_SCHEMAS, run_tool
 
 logger = logging.getLogger(__name__)
 
 MAX_STEPS = 250
+MAX_REVIEW_ROUNDS = 2
 
 # Load default system prompt from SYSTEM_PROMPT.md if it exists
 _PROMPT_FILE = Path(__file__).parent.parent / "SYSTEM_PROMPT.md"
@@ -226,6 +229,10 @@ async def run_agent(user_message: str) -> AsyncIterator[str]:
     history = await _load_history()
     messages = [{"role": "system", "content": system_prompt}] + history
 
+    # Track reviewer state for this run
+    _user_task = user_message  # Original task for reviewer context
+    _review_rounds = 0         # How many times reviewer has rejected
+
     for step in range(MAX_STEPS):
         cfg = await get_configs()
 
@@ -281,8 +288,87 @@ async def run_agent(user_message: str) -> AsyncIterator[str]:
                     "arguments": fn_args_str,
                 })
 
-                # Execute the tool
-                result = await run_tool(fn_name, fn_args)
+                # ── Reviewer hook: intercept git_commit ──
+                result = None
+                if fn_name == "git_commit":
+                    # Check if there are staged changes worth reviewing
+                    from sandbox import shell_exec as _shell
+                    diff_check = await _shell("cd /home/daytona/repo && git diff --cached --stat 2>&1", timeout=10)
+                    has_changes = bool(diff_check.get("stdout", "").strip())
+
+                    if has_changes and _review_rounds < MAX_REVIEW_ROUNDS:
+                        # Run the reviewer
+                        yield sse({
+                            "type": "review_start",
+                            "round": _review_rounds + 1,
+                            "max_rounds": MAX_REVIEW_ROUNDS,
+                        })
+
+                        verdict = await run_reviewer(_user_task, cfg)
+                        _review_rounds += 1
+
+                        if verdict.get("approved"):
+                            # Reviewer approved — proceed with commit
+                            yield sse({
+                                "type": "review_result",
+                                "approved": True,
+                                "feedback": verdict.get("feedback", ""),
+                            })
+                            result = await run_tool(fn_name, fn_args)
+                        else:
+                            # Reviewer rejected — block commit, return feedback
+                            issues = verdict.get("issues", [])
+                            feedback = verdict.get("feedback", "Reviewer rejected the changes.")
+                            issues_text = "\n".join(f"  - {i}" for i in issues) if issues else ""
+                            review_feedback = (
+                                f"[REVIEWER REJECTED — Round {_review_rounds}/{MAX_REVIEW_ROUNDS}]\n"
+                                f"The code reviewer found issues with your changes and blocked the commit.\n"
+                            )
+                            if issues_text:
+                                review_feedback += f"\nIssues:\n{issues_text}\n"
+                            review_feedback += f"\nFeedback:\n{feedback}\n"
+                            review_feedback += (
+                                f"\nFix the issues above and try committing again. "
+                                f"You have {MAX_REVIEW_ROUNDS - _review_rounds} review round(s) remaining."
+                            )
+
+                            yield sse({
+                                "type": "review_result",
+                                "approved": False,
+                                "feedback": feedback,
+                                "issues": issues,
+                            })
+
+                            logger.info(
+                                "Reviewer REJECTED commit (round %d/%d): %s",
+                                _review_rounds, MAX_REVIEW_ROUNDS,
+                                feedback[:200],
+                            )
+
+                            # Return rejection as tool result — agent sees it and reworks
+                            result = review_feedback
+                    elif has_changes and _review_rounds >= MAX_REVIEW_ROUNDS:
+                        # Max review rounds exhausted — force commit with warning
+                        yield sse({
+                            "type": "review_result",
+                            "approved": True,
+                            "feedback": f"Forced after {MAX_REVIEW_ROUNDS} review rounds.",
+                            "forced": True,
+                        })
+                        logger.warning("Forcing commit after %d review rounds", _review_rounds)
+                        result = await run_tool(fn_name, fn_args)
+                        result = (
+                            f"[COMMITTED — forced after {MAX_REVIEW_ROUNDS} reviewer rejections]\n"
+                            f"The reviewer rejected this {MAX_REVIEW_ROUNDS} times. "
+                            f"Committing anyway, but review the feedback above carefully.\n\n"
+                            f"{result}"
+                        )
+                    else:
+                        # No staged changes — let commit proceed normally
+                        result = await run_tool(fn_name, fn_args)
+                else:
+                    # Not git_commit — execute tool normally
+                    result = await run_tool(fn_name, fn_args)
 
                 # Notify frontend about tool result
                 yield sse({
