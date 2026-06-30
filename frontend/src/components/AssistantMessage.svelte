@@ -86,6 +86,9 @@
           i++;
         }
         result.push({ type: 'tools', tools });
+      } else if (part.type === 'review') {
+        result.push(part);
+        i++;
       } else {
         i++;
       }
@@ -104,6 +107,31 @@
         <div class="text-block md">{@html renderMarkdown(segment.text)}</div>
       {:else if segment.type === 'tools'}
         <ToolGroup tools={segment.tools} />
+      {:else if segment.type === 'review'}
+        <div class="review-block" class:running={segment.status === 'running'} class:approved={segment.status === 'approved'} class:rejected={segment.status === 'rejected'}>
+          <div class="review-header">
+            <span class="review-icon">{segment.status === 'running' ? '🔍' : segment.status === 'approved' ? '✅' : '❌'}</span>
+            <span class="review-title">
+              {#if segment.status === 'running'}
+                Code Review — Round {segment.round}/{segment.maxRounds}
+              {:else if segment.status === 'approved'}
+                {#if segment.forced}Review Forced Through{:else}Review Approved{/if}
+              {:else}
+                Review Rejected — Round {segment.round}/{segment.maxRounds}
+              {/if}
+            </span>
+          </div>
+          {#if segment.feedback}
+            <div class="review-feedback">{segment.feedback}</div>
+          {/if}
+          {#if segment.issues && segment.issues.length > 0}
+            <ul class="review-issues">
+              {#each segment.issues as issue}
+                <li>{issue}</li>
+              {/each}
+            </ul>
+          {/if}
+        </div>
       {/if}
     {/each}
     {#if isStreaming && segments.length === 0}
@@ -157,4 +185,59 @@
   }
   .thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
   .thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+  /* Review block */
+  .review-block {
+    border: 1px solid var(--color-border);
+    border-radius: 12px;
+    overflow: hidden;
+    font-size: 12px;
+  }
+  .review-block.running {
+    border-color: var(--color-accent);
+    background: var(--color-surface-alt);
+  }
+  .review-block.approved {
+    border-color: var(--color-success);
+    background: var(--color-surface-alt);
+  }
+  .review-block.rejected {
+    border-color: var(--color-error);
+    background: var(--color-surface-alt);
+  }
+  .review-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    font-weight: 600;
+    font-size: 12px;
+  }
+  .review-block.running .review-header {
+    background: color-mix(in srgb, var(--color-accent) 8%, transparent);
+  }
+  .review-block.approved .review-header {
+    background: color-mix(in srgb, var(--color-success) 8%, transparent);
+  }
+  .review-block.rejected .review-header {
+    background: color-mix(in srgb, var(--color-error) 8%, transparent);
+  }
+  .review-icon { font-size: 14px; }
+  .review-title { color: var(--color-text); }
+  .review-feedback {
+    padding: 8px 12px;
+    color: var(--color-text-secondary);
+    line-height: 1.5;
+    border-top: 1px solid var(--color-border);
+    white-space: pre-wrap;
+  }
+  .review-issues {
+    margin: 0;
+    padding: 4px 12px 10px 28px;
+    color: var(--color-text-secondary);
+    line-height: 1.6;
+  }
+  .review-issues li {
+    padding: 2px 0;
+  }
 </style>

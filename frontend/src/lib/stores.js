@@ -212,6 +212,26 @@ function handleStreamEvent(data, assistantId) {
           break;
         }
       }
+    } else if (ev.type === 'review_start') {
+      content.push({
+        type: 'review',
+        status: 'running',
+        round: ev.round,
+        maxRounds: ev.max_rounds,
+      });
+    } else if (ev.type === 'review_result') {
+      for (let i = content.length - 1; i >= 0; i--) {
+        if (content[i].type === 'review') {
+          content[i] = {
+            ...content[i],
+            status: ev.approved ? 'approved' : 'rejected',
+            feedback: ev.feedback || '',
+            issues: ev.issues || [],
+            forced: ev.forced || false,
+          };
+          break;
+        }
+      }
     } else if (ev.type === 'error') {
       agentError.set(ev.message);
       showToast(ev.message, 'error', 5000);

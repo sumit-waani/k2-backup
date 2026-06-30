@@ -188,8 +188,8 @@ async def run_reviewer(
 ) -> dict:
     """Run the reviewer subagent. Returns parsed verdict dict.
 
-    On any failure (config, network, parse), returns approved=True
-    with a warning — we don't want reviewer failures to block shipping.
+    Fail-closed on HTTP/parse errors (blocks commit). Fail-open only on
+    config errors (no LLM) or network failures (transient).
     """
     base_url = cfg.get("llm1_url", "")
     api_key = cfg.get("llm1_api_key", "")
@@ -241,9 +241,9 @@ async def run_reviewer(
                 body = resp.text[:500]
                 logger.error("Reviewer LLM HTTP %d: %s", resp.status_code, body)
                 return {
-                    "approved": True,
-                    "issues": [],
-                    "feedback": f"Reviewer skipped — LLM returned HTTP {resp.status_code}.",
+                    "approved": False,
+                    "issues": [f"Reviewer LLM returned HTTP {resp.status_code}"],
+                    "feedback": f"Reviewer LLM returned HTTP {resp.status_code}: {body[:300]}",
                 }
 
             data = resp.json()
@@ -257,9 +257,9 @@ async def run_reviewer(
             if not content:
                 logger.error("Reviewer returned empty response")
                 return {
-                    "approved": True,
-                    "issues": [],
-                    "feedback": "Reviewer skipped — empty LLM response.",
+                    "approved": False,
+                    "issues": ["Reviewer LLM returned empty response"],
+                    "feedback": "Reviewer LLM returned an empty response. This usually means the model is overloaded or the prompt was too large.",
                 }
 
             # Parse JSON verdict (handle markdown code fences)
