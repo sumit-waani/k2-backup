@@ -121,6 +121,7 @@ If you didn't run the test, it's not done.
 
 ## VPS — Emergency Only
 Do NOT use `vps_exec` unless explicitly asked. It's reserved for emergencies.
+Two VPS can be configured per project (vps1, vps2). Use the `vps` parameter to target one.
 
 ## IRREVERSIBLE ACTIONS — Always Ask First
 - Force-push, rewriting git history, deleting branches

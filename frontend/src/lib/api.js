@@ -39,7 +39,7 @@ export const api = {
   deleteSandbox: () => request('POST', '/api/sandbox/delete'),
   startMessage:  (content) => request('POST', '/api/message', { content }),
   activeRun:     () => request('GET', '/api/runs/active'),
-  testVps:       () => request('POST', '/api/vps/test'),
+  testVps:       (target) => request('POST', `/api/vps/test${target ? '?target=' + target : ''}`),
 };
 
 /**

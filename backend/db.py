@@ -41,6 +41,11 @@ CREATE TABLE IF NOT EXISTS configs (
     vps_username TEXT DEFAULT '',
     vps_password TEXT DEFAULT '',
     vps_ssh_key TEXT DEFAULT '',
+    vps2_host TEXT DEFAULT '',
+    vps2_port TEXT DEFAULT '22',
+    vps2_username TEXT DEFAULT '',
+    vps2_password TEXT DEFAULT '',
+    vps2_ssh_key TEXT DEFAULT '',
     github_repo_url TEXT DEFAULT '',
     github_pat TEXT DEFAULT '',
     scratchpad TEXT DEFAULT ''
@@ -136,6 +141,12 @@ async def init_db() -> None:
             if vps_col not in cols:
                 await db.execute(
                     f"ALTER TABLE configs ADD COLUMN {vps_col} TEXT DEFAULT ''"
+                )
+        for vps2_col in ("vps2_host", "vps2_port", "vps2_username", "vps2_password", "vps2_ssh_key"):
+            if vps2_col not in cols:
+                default = "'22'" if vps2_col == "vps2_port" else "''"
+                await db.execute(
+                    f"ALTER TABLE configs ADD COLUMN {vps2_col} TEXT DEFAULT {default}"
                 )
         for git_col in ("github_repo_url", "github_pat", "scratchpad"):
             if git_col not in cols:

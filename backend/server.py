@@ -106,7 +106,7 @@ class LoginIn(BaseModel):
 class MessageIn(BaseModel):
     content: str
 
-_MASK_FIELDS = {"llm1_api_key", "firecrawl_key", "daytona_api_key", "vps_password", "vps_ssh_key", "github_pat"}
+_MASK_FIELDS = {"llm1_api_key", "firecrawl_key", "daytona_api_key", "vps_password", "vps_ssh_key", "vps2_password", "vps2_ssh_key", "github_pat"}
 
 class SettingsIn(BaseModel):
     llm1_url: str | None = None
@@ -121,6 +121,11 @@ class SettingsIn(BaseModel):
     vps_username: str | None = None
     vps_password: str | None = None
     vps_ssh_key: str | None = None
+    vps2_host: str | None = None
+    vps2_port: str | None = None
+    vps2_username: str | None = None
+    vps2_password: str | None = None
+    vps2_ssh_key: str | None = None
     github_repo_url: str | None = None
     github_pat: str | None = None
     scratchpad: str | None = None
@@ -243,18 +248,20 @@ async def post_settings(body: SettingsIn, user=Depends(current_user)) -> dict:
     return {"settings": _mask(cfg)}
 
 @app.post("/api/vps/test")
-async def vps_test(user=Depends(current_user)) -> dict:
+async def vps_test(target: str = Query(default="vps1"), user=Depends(current_user)) -> dict:
     """Test VPS SSH connection using saved credentials."""
     import paramiko, io as _io
     cfg = await get_configs()
-    host = cfg.get("vps_host", "")
-    if not host:
-        raise HTTPException(400, "VPS host not configured")
 
-    port = int(cfg.get("vps_port") or 22)
-    username = cfg.get("vps_username") or "root"
-    password = cfg.get("vps_password") or ""
-    key_data = cfg.get("vps_ssh_key") or ""
+    prefix = "vps" if target == "vps1" else "vps2"
+    host = cfg.get(f"{prefix}_host", "")
+    if not host:
+        raise HTTPException(400, f"{target.upper()} host not configured")
+
+    port = int(cfg.get(f"{prefix}_port") or 22)
+    username = cfg.get(f"{prefix}_username") or "root"
+    password = cfg.get(f"{prefix}_password") or ""
+    key_data = cfg.get(f"{prefix}_ssh_key") or ""
 
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())

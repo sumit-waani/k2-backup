@@ -25,6 +25,13 @@
   let vps_username = $state('');
   let vps_password = $state('');
   let vps_ssh_key = $state('');
+  let vps2_host = $state('');
+  let vps2_port = $state('22');
+  let vps2_username = $state('');
+  let vps2_password = $state('');
+  let vps2_ssh_key = $state('');
+  let vps2Testing = $state(false);
+  let vps2TestResult = $state(null);
   let github_repo_url = $state('');
   let github_pat = $state('');
   let scratchpad = $state('');
@@ -55,6 +62,11 @@
       vps_username = s.vps_username || '';
       vps_password = '';
       vps_ssh_key = '';
+      vps2_host = s.vps2_host || '';
+      vps2_port = s.vps2_port || '22';
+      vps2_username = s.vps2_username || '';
+      vps2_password = '';
+      vps2_ssh_key = '';
       github_repo_url = s.github_repo_url || '';
       github_pat = '';
       scratchpad = s.scratchpad || '';
@@ -85,6 +97,13 @@
       const hasKey = vps_ssh_key && !isMasked(vps_ssh_key);
       if (hasPassword) { patch.vps_password = vps_password; patch.vps_ssh_key = ''; }
       else if (hasKey) { patch.vps_ssh_key = vps_ssh_key; patch.vps_password = ''; }
+      if (vps2_host) patch.vps2_host = vps2_host;
+      if (vps2_port) patch.vps2_port = vps2_port;
+      if (vps2_username) patch.vps2_username = vps2_username;
+      const hasPassword2 = vps2_password && !isMasked(vps2_password);
+      const hasKey2 = vps2_ssh_key && !isMasked(vps2_ssh_key);
+      if (hasPassword2) { patch.vps2_password = vps2_password; patch.vps2_ssh_key = ''; }
+      else if (hasKey2) { patch.vps2_ssh_key = vps2_ssh_key; patch.vps2_password = ''; }
       if (github_repo_url) patch.github_repo_url = github_repo_url;
       if (github_pat && !isMasked(github_pat)) patch.github_pat = github_pat;
       if (scratchpad !== undefined) patch.scratchpad = scratchpad;
@@ -99,6 +118,8 @@
       daytona_api_key = '';
       vps_password = '';
       vps_ssh_key = '';
+      vps2_password = '';
+      vps2_ssh_key = '';
       github_pat = '';
       showToast('Settings saved', 'success');
     } catch (e) {
@@ -198,6 +219,50 @@
     });
   }
 
+  async function handleTestVps2() {
+    vps2Testing = true;
+    vps2TestResult = null;
+    try {
+      const patch = {};
+      if (vps2_host) patch.vps2_host = vps2_host;
+      if (vps2_port) patch.vps2_port = vps2_port;
+      if (vps2_username) patch.vps2_username = vps2_username;
+      const _hasPw = vps2_password && !isMasked(vps2_password);
+      const _hasKey = vps2_ssh_key && !isMasked(vps2_ssh_key);
+      if (_hasPw) { patch.vps2_password = vps2_password; patch.vps2_ssh_key = ''; }
+      else if (_hasKey) { patch.vps2_ssh_key = vps2_ssh_key; patch.vps2_password = ''; }
+      if (Object.keys(patch).length) await api.saveSettings(patch);
+
+      const r = await api.testVps('vps2');
+      vps2TestResult = r;
+    } catch (e) {
+      vps2TestResult = { ok: false, message: e.message };
+    } finally {
+      vps2Testing = false;
+    }
+  }
+
+  async function handleClearVps2() {
+    showConfirm('Clear VPS 2 credentials', 'This will remove all saved VPS 2 connection details.', async () => {
+      try {
+        await api.saveSettings({
+          vps2_host: '', vps2_port: '22', vps2_username: '',
+          vps2_password: '', vps2_ssh_key: ''
+        });
+        vps2_host = ''; vps2_port = '22'; vps2_username = '';
+        vps2_password = ''; vps2_ssh_key = '';
+        vps2TestResult = null;
+        if (settings) {
+          settings.vps2_host = ''; settings.vps2_port = '22';
+          settings.vps2_username = ''; settings.vps2_password = ''; settings.vps2_ssh_key = '';
+        }
+        showToast('VPS 2 credentials cleared', 'success');
+      } catch (e) {
+        showToast(e.message, 'error', 6000);
+      }
+    });
+  }
+
   function handleClose() { showSettings.set(false); }
 
   function handleBackdropClick(e) {
@@ -264,7 +329,7 @@
         </section>
 
         <section class="settings-section">
-          <h3>VPS (Remote Server)</h3>
+          <h3>VPS 1 (Remote Server)</h3>
           <div class="grid-2">
             <label>
               <span>Host</span>
@@ -301,6 +366,49 @@
             {#if vpsTestResult}
               <span class="vps-test-result" class:success={vpsTestResult.ok} class:fail={!vpsTestResult.ok}>
                 {vpsTestResult.message}
+              </span>
+            {/if}
+          </div>
+        </section>
+
+        <section class="settings-section">
+          <h3>VPS 2 (Remote Server)</h3>
+          <div class="grid-2">
+            <label>
+              <span>Host</span>
+              <input type="text" bind:value={vps2_host} placeholder="10.0.0.1" />
+            </label>
+            <label>
+              <span>Port</span>
+              <input type="text" bind:value={vps2_port} placeholder="22" />
+            </label>
+          </div>
+          <label>
+            <span>Username</span>
+            <input type="text" bind:value={vps2_username} placeholder="ubuntu" />
+          </label>
+          <label>
+            <span>Password <small>(optional if using key)</small></span>
+            <input type="password" bind:value={vps2_password} placeholder={settings?.vps2_password ? '••••••••' : 'leave empty if using key'} />
+          </label>
+          <label>
+            <span>SSH Private Key <small>(optional if using password)</small></span>
+            <textarea bind:value={vps2_ssh_key} rows="4" placeholder={settings?.vps2_ssh_key ? '••••••••' : '-----BEGIN RSA PRIVATE KEY-----\n...'}></textarea>
+          </label>
+          <div class="vps-test-row">
+            <button class="btn-secondary" onclick={handleTestVps2} disabled={vps2Testing || !vps2_host}>
+              {#if vps2Testing}
+                Testing…
+              {:else}
+                Check Connection
+              {/if}
+            </button>
+            <button class="btn-danger-sm" onclick={handleClearVps2} disabled={!settings?.vps2_host}>
+              Clear VPS 2 Creds
+            </button>
+            {#if vps2TestResult}
+              <span class="vps-test-result" class:success={vps2TestResult.ok} class:fail={!vps2TestResult.ok}>
+                {vps2TestResult.message}
               </span>
             {/if}
           </div>

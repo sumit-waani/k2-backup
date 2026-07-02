@@ -157,7 +157,8 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "vps_exec",
             "description": (
-                "Execute a shell command on the configured VPS over SSH. "
+                "Execute a shell command on a configured VPS over SSH. "
+                "Use the 'vps' parameter to target vps1 (default) or vps2. "
                 "Credentials are read from VPS settings. "
                 "Use for deployments, server inspection, log tailing."
             ),
@@ -167,6 +168,11 @@ TOOL_SCHEMAS: list[dict] = [
                     "command": {
                         "type": "string",
                         "description": "Shell command to execute on the VPS",
+                    },
+                    "vps": {
+                        "type": "string",
+                        "description": "Which VPS to target: vps1 (default) or vps2",
+                        "enum": ["vps1", "vps2"],
                     },
                 },
                 "required": ["command"],
@@ -583,13 +589,15 @@ async def _handle_vps_exec(args: dict) -> str:
     if not command:
         return _error("vps_exec", "No command provided.")
     cfg = await get_configs()
-    host = (cfg.get("vps_host") or "").strip()
-    port = int(cfg.get("vps_port") or 22)
-    username = (cfg.get("vps_username") or "").strip()
-    password = (cfg.get("vps_password") or "").strip()
-    ssh_key = (cfg.get("vps_ssh_key") or "").strip()
+    target = args.get("vps", "vps1")
+    prefix = "vps" if target == "vps1" else "vps2"
+    host = (cfg.get(f"{prefix}_host") or "").strip()
+    port = int(cfg.get(f"{prefix}_port") or 22)
+    username = (cfg.get(f"{prefix}_username") or "").strip()
+    password = (cfg.get(f"{prefix}_password") or "").strip()
+    ssh_key = (cfg.get(f"{prefix}_ssh_key") or "").strip()
     if not host or not username:
-        return _error("vps_exec", "VPS not configured. Open Settings → VPS.")
+        return _error("vps_exec", f"{target.upper()} not configured. Open Settings → VPS.")
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
